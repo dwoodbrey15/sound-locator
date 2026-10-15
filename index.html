@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Stereo mic sound locator</title>
+<style>
+:root{--bg:#eef2f5;--fg:#14212b;--mut:#5b6b77;--card:#fff;--line:#c3cfd8;--acc:#0b7a75;--ok:#1a7f37;--bad:#b42318;
+box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#0f1a22;--fg:#e4edf2;--mut:#8da0ad;--card:#16242e;--line:#2c3f4c;--acc:#3fd0c4;--ok:#5fd97f;--bad:#ff8a7a}}
+:root[data-theme="dark"]{--bg:#0f1a22;--fg:#e4edf2;--mut:#8da0ad;--card:#16242e;--line:#2c3f4c;--acc:#3fd0c4;--ok:#5fd97f;--bad:#ff8a7a}
+html{color-scheme:light dark}
+*{box-sizing:border-box}
+body{margin:0;padding:14px;background:var(--bg);color:var(--fg);font:16px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:640px;margin:0 auto}
+h1{font-size:1.25rem;margin:0 0 4px}
+p.sub{margin:0 0 12px;color:var(--mut);font-size:.9rem}
+button{font:inherit;border:1px solid var(--line);background:var(--card);color:var(--fg);border-radius:10px;padding:10px 14px}
+button.main{background:var(--acc);border-color:var(--acc);color:var(--bg);font-weight:600;width:100%;padding:14px;margin-bottom:12px}
+button:disabled{opacity:.7}
+canvas{width:100%;display:block;background:var(--card);border:1px solid var(--line);border-radius:12px}
+.panel{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px;margin-top:12px}
+.row{display:flex;justify-content:space-between;gap:8px;font-size:.9rem;padding:2px 0}
+.row span:first-child{color:var(--mut)}
+#verdict{font-weight:600;margin-top:6px}
+#verdict.ok{color:var(--ok)}#verdict.bad{color:var(--bad)}
+.bar{height:8px;background:var(--line);border-radius:4px;overflow:hidden;margin:4px 0 8px}
+.bar i{display:block;height:100%;width:0;background:var(--acc)}
+label{display:block;font-size:.9rem;margin-top:10px}
+input[type=range]{width:100%}
+#bearing{font-size:1.1rem;font-weight:600;text-align:center;margin-top:8px;min-height:1.5em}
+#err{color:var(--bad);font-size:.9rem;margin-top:8px}
+</style>
+</head>
+<body>
+<main>
+<h1>Stereo mic sound locator</h1>
+<p class="sub">Hold the phone flat or upright in landscape, then clap or snap around it.</p>
+<button class="main" id="go">Start listening</button>
+<canvas id="c"></canvas>
+<div id="bearing">No sound yet</div>
+
+<div class="panel">
+<div class="row"><span>Channels reported by Safari</span><span id="ch">-</span></div>
+<div class="row"><span>Sample rate</span><span id="sr">-</span></div>
+<div id="verdict">Waiting for the mic</div>
+<div style="margin-top:10px;font-size:.85rem;color:var(--mut)">Left mic level</div>
+<div class="bar"><i id="ml"></i></div>
+<div style="font-size:.85rem;color:var(--mut)">Right mic level</div>
+<div class="bar"><i id="mr"></i></div>
+</div>
+
+<div class="panel">
+<label>Mic spacing: <b id="spv">14</b> cm
+<input type="range" id="sp" min="8" max="18" step="0.5" value="14"></label>
+<label>Trigger level: <b id="sev">0.02</b>
+<input type="range" id="sens" min="0.005" max="0.1" step="0.005" value="0.02"></label>
+<button id="flip" style="margin-top:12px">Swap left and right</button>
+</div>
+<div id="err"></div>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+const C=343;
+let ctx,events=[],flip=false,level={l:0,r:0},framesSeen=0,diffSeen=0,fs=48000,last=null;
+
+$('sp').oninput=()=>$('spv').textContent=$('sp').value;
+$('sens').oninput=()=>$('sev').textContent=$('sens').value;
+$('flip').onclick=()=>{flip=!flip;$('flip').textContent=flip?'Left and right swapped (tap to undo)':'Swap left and right';};
+
+$('go').onclick=async()=>{
+  try{
+    const stream=await navigator.mediaDevices.getUserMedia({audio:{channelCount:{ideal:2},echoCancellation:false,noiseSuppression:false,autoGainControl:false}});
+    const st=stream.getAudioTracks()[0].getSettings?stream.getAudioTracks()[0].getSettings():{};
+    $('ch').textContent=st.channelCount||'not reported';
+    ctx=new (window.AudioContext||window.webkitAudioContext)();
+    await ctx.resume();
+    fs=ctx.sampleRate;$('sr').textContent=fs+' Hz';
+    const src=ctx.createMediaStreamSource(stream);
+    const proc=ctx.createScriptProcessor(2048,2,2);
+    proc.channelCount=2;proc.channelCountMode='explicit';proc.channelInterpretation='speakers';
+    proc.onaudioprocess=onAudio;
+    src.connect(proc);proc.connect(ctx.destination);
+    window._keep=[stream,src,proc];
+    $('go').disabled=true;$('go').textContent='Listening';
+    $('verdict').textContent='Make some noise';
+    $('err').textContent='';
+  }catch(e){
+    $('err').textContent='Could not open the mic ('+e.name+'). Allow microphone access, and open this page directly in Safari rather than inside another app.';
+  }
+};
+
+function onAudio(e){
+  const L=e.inputBuffer.getChannelData(0),R=e.inputBuffer.getChannelData(1),N=L.length;
+  let sl=0,sr=0,df=0;
+  for(let i=0;i<N;i++){sl+=L[i]*L[i];sr+=R[i]*R[i];const d=Math.abs(L[i]-R[i]);if(d>df)df=d;}
+  const rl=Math.sqrt(sl/N),rr=Math.sqrt(sr/N);
+  level={l:rl,r:rr};
+  if(rl>0.003||rr>0.003){
+    framesSeen++;if(df>1e-5)diffSeen++;
+    if(framesSeen>=5){
+      const stereo=diffSeen/framesSeen>0.5,v=$('verdict');
+      v.textContent=stereo?'True stereo: the two channels differ, so direction finding can work':'Mono: both channels are identical, so Safari is not giving separate mics';
+      v.className=stereo?'ok':'bad';
+    }
+  }
+  if(Math.max(rl,rr)<+$('sens').value)return;
+  const d=+$('sp').value/100,M=Math.min(40,Math.ceil(d/C*fs)+2);
+  const a=new Float32Array(N),b=new Float32Array(N);
+  for(let i=1;i<N;i++){a[i]=L[i]-0.95*L[i-1];b[i]=R[i]-0.95*R[i-1];}
+  let ea=0,eb=0;
+  for(let n=M;n<N-M;n++){ea+=a[n]*a[n];eb+=b[n]*b[n];}
+  const norm=Math.sqrt(ea*eb)||1,cc=[];
+  let bi=0,bv=-Infinity;
+  for(let k=-M;k<=M;k++){
+    let s=0;for(let n=M;n<N-M;n++)s+=a[n]*b[n+k];
+    cc.push(s);if(s>bv){bv=s;bi=k+M;}
+  }
+  let k=bi-M;
+  if(bi>0&&bi<cc.length-1){
+    const y0=cc[bi-1],y1=cc[bi],y2=cc[bi+1],den=y0-2*y1+y2;
+    if(den!==0)k+=0.5*(y0-y2)/den;
+  }
+  if(bv/norm<0.25)return;
+  let x=-(k/fs)*C/d;if(flip)x=-x;
+  x=Math.max(-1,Math.min(1,x));
+  const ang=Math.asin(x),now=performance.now();
+  events.push({a:ang,s:Math.min(1,Math.max(rl,rr)*8),t:now});
+  last={a:ang,t:now};
+}
+
+function draw(){
+  const cv=$('c'),dpr=window.devicePixelRatio||1,W=cv.clientWidth,H=W*0.6;
+  if(cv.width!==Math.round(W*dpr)){cv.width=Math.round(W*dpr);cv.height=Math.round(H*dpr);}
+  const g=cv.getContext('2d');g.setTransform(dpr,0,0,dpr,0,0);g.clearRect(0,0,W,H);
+  const cs=getComputedStyle(document.documentElement);
+  const line=cs.getPropertyValue('--line').trim(),mut=cs.getPropertyValue('--mut').trim(),acc=cs.getPropertyValue('--acc').trim();
+  const cx=W/2,cy=H*0.93,R=Math.min(W*0.46,H*0.84);
+  g.strokeStyle=line;g.lineWidth=1;
+  for(const f of [1/3,2/3,1]){g.beginPath();g.arc(cx,cy,R*f,Math.PI,0);g.stroke();}
+  for(const deg of [-90,-60,-30,0,30,60,90]){
+    const r=deg*Math.PI/180;g.beginPath();g.moveTo(cx,cy);g.lineTo(cx+Math.sin(r)*R,cy-Math.cos(r)*R);g.stroke();
+  }
+  g.fillStyle=mut;g.font='600 13px system-ui,sans-serif';
+  g.fillText('Left',6,cy-4);g.textAlign='right';g.fillText('Right',W-6,cy-4);g.textAlign='left';
+  const now=performance.now();
+  events=events.filter(e=>now-e.t<3000);
+  for(const e of events){
+    g.globalAlpha=(1-(now-e.t)/3000)*0.55;g.fillStyle=acc;
+    g.beginPath();g.arc(cx+Math.sin(e.a)*R*0.78,cy-Math.cos(e.a)*R*0.78,8+e.s*26,0,7);g.fill();
+  }
+  g.globalAlpha=1;
+  if(last&&now-last.t<800){
+    g.strokeStyle=acc;g.lineWidth=2;g.beginPath();g.moveTo(cx,cy);
+    g.lineTo(cx+Math.sin(last.a)*R,cy-Math.cos(last.a)*R);g.stroke();
+    const deg=Math.round(Math.abs(last.a)*180/Math.PI);
+    $('bearing').textContent=deg<4?'Straight ahead':deg+'° to the '+(last.a>0?'right':'left');
+  }
+  $('ml').style.width=Math.min(100,level.l*400)+'%';
+  $('mr').style.width=Math.min(100,level.r*400)+'%';
+  requestAnimationFrame(draw);
+}
+requestAnimationFrame(draw);
+</script>
+</body>
+</html>
