@@ -21,7 +21,8 @@ button:disabled{opacity:.7}
 canvas{width:100%;display:block;background:var(--card);border:1px solid var(--line);border-radius:12px}
 .panel{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px;margin-top:12px}
 .row{display:flex;justify-content:space-between;gap:8px;font-size:.9rem;padding:2px 0}
-.row span:first-child{color:var(--mut)}
+.row span:first-child{color:var(--mut);flex:none}
+.row span:last-child{text-align:right;word-break:break-word}
 #verdict{font-weight:600;margin-top:6px}
 #verdict.ok{color:var(--ok)}#verdict.bad{color:var(--bad)}
 .bar{height:8px;background:var(--line);border-radius:4px;overflow:hidden;margin:4px 0 8px}
@@ -43,6 +44,9 @@ input[type=range]{width:100%}
 <div class="panel">
 <div class="row"><span>Channels reported by Safari</span><span id="ch">-</span></div>
 <div class="row"><span>Sample rate</span><span id="sr">-</span></div>
+<div class="row"><span>Inputs listed</span><span id="devs">-</span></div>
+<div class="row"><span>Track settings</span><span id="raw">-</span></div>
+<div class="row"><span>Peak left / right</span><span id="pk">-</span></div>
 <div id="verdict">Waiting for the mic</div>
 <div style="margin-top:10px;font-size:.85rem;color:var(--mut)">Left mic level</div>
 <div class="bar"><i id="ml"></i></div>
@@ -62,7 +66,7 @@ input[type=range]{width:100%}
 <script>
 const $=id=>document.getElementById(id);
 const C=343;
-let ctx,events=[],flip=false,level={l:0,r:0},framesSeen=0,diffSeen=0,fs=48000,last=null;
+let ctx,events=[],flip=false,level={l:0,r:0},framesSeen=0,diffSeen=0,liveL=0,liveR=0,pkL=0,pkR=0,fs=48000,last=null;
 
 $('sp').oninput=()=>$('spv').textContent=$('sp').value;
 $('sens').oninput=()=>$('sev').textContent=$('sens').value;
@@ -70,9 +74,20 @@ $('flip').onclick=()=>{flip=!flip;$('flip').textContent=flip?'Left and right swa
 
 $('go').onclick=async()=>{
   try{
-    const stream=await navigator.mediaDevices.getUserMedia({audio:{channelCount:{ideal:2},echoCancellation:false,noiseSuppression:false,autoGainControl:false}});
-    const st=stream.getAudioTracks()[0].getSettings?stream.getAudioTracks()[0].getSettings():{};
-    $('ch').textContent=st.channelCount||'not reported';
+    const base={echoCancellation:false,noiseSuppression:false,autoGainControl:false,voiceIsolation:false};
+    const tries=[['exact 2 channels',{...base,channelCount:{exact:2}}],['ideal 2 channels',{...base,channelCount:{ideal:2}}],['plain',{...base}]];
+    let stream=null,how='',errs=[];
+    for(const [name,a] of tries){
+      try{stream=await navigator.mediaDevices.getUserMedia({audio:a});how=name;break;}
+      catch(e){if(e.name==='NotAllowedError')throw e;errs.push(name+': '+e.name);}
+    }
+    if(!stream)throw new Error(errs.join(', '));
+    const tr=stream.getAudioTracks()[0];
+    const st=tr.getSettings?tr.getSettings():{};
+    $('ch').textContent=(st.channelCount||'not reported')+' (via '+how+')';
+    let devs=[];try{devs=(await navigator.mediaDevices.enumerateDevices()).filter(d=>d.kind==='audioinput');}catch(_){}
+    $('devs').textContent=devs.length?devs.map(d=>d.label||'unnamed').join('; '):'none listed';
+    $('raw').textContent=JSON.stringify(st);
     ctx=new (window.AudioContext||window.webkitAudioContext)();
     await ctx.resume();
     fs=ctx.sampleRate;$('sr').textContent=fs+' Hz';
@@ -86,7 +101,7 @@ $('go').onclick=async()=>{
     $('verdict').textContent='Make some noise';
     $('err').textContent='';
   }catch(e){
-    $('err').textContent='Could not open the mic ('+e.name+'). Allow microphone access, and open this page directly in Safari rather than inside another app.';
+    $('err').textContent='Could not open the mic ('+e.name+(e.message?': '+e.message:'')+'). If it says NotAllowedError, allow microphone access and open this page directly in Safari.';
   }
 };
 
@@ -96,12 +111,17 @@ function onAudio(e){
   for(let i=0;i<N;i++){sl+=L[i]*L[i];sr+=R[i]*R[i];const d=Math.abs(L[i]-R[i]);if(d>df)df=d;}
   const rl=Math.sqrt(sl/N),rr=Math.sqrt(sr/N);
   level={l:rl,r:rr};
+  if(rl>pkL)pkL=rl;if(rr>pkR)pkR=rr;
+  const db=x=>(20*Math.log10(x||1e-6)).toFixed(0)+' dB';
+  $('pk').textContent=db(pkL)+' / '+db(pkR);
   if(rl>0.003||rr>0.003){
-    framesSeen++;if(df>1e-5)diffSeen++;
+    framesSeen++;if(df>1e-5)diffSeen++;if(rl>0.002)liveL++;if(rr>0.002)liveR++;
     if(framesSeen>=5){
-      const stereo=diffSeen/framesSeen>0.5,v=$('verdict');
-      v.textContent=stereo?'True stereo: the two channels differ, so direction finding can work':'Mono: both channels are identical, so Safari is not giving separate mics';
-      v.className=stereo?'ok':'bad';
+      const v=$('verdict');let ok=false,t;
+      if(Math.min(liveL,liveR)/framesSeen<0.3)t='Only one channel carries sound ('+(liveL>liveR?'left':'right')+'). Safari is giving this page a single mic, so direction finding cannot work here.';
+      else if(diffSeen/framesSeen<=0.5)t='Mono: both channels are identical, so Safari is not giving separate mics.';
+      else{ok=true;t='Two live channels that differ: direction finding can work.';}
+      v.textContent=t;v.className=ok?'ok':'bad';
     }
   }
   if(Math.max(rl,rr)<+$('sens').value)return;
@@ -156,8 +176,9 @@ function draw(){
     const deg=Math.round(Math.abs(last.a)*180/Math.PI);
     $('bearing').textContent=deg<4?'Straight ahead':deg+'° to the '+(last.a>0?'right':'left');
   }
-  $('ml').style.width=Math.min(100,level.l*400)+'%';
-  $('mr').style.width=Math.min(100,level.r*400)+'%';
+  const bar=x=>Math.max(0,Math.min(100,(20*Math.log10(x||1e-6)+70)/60*100))+'%';
+  $('ml').style.width=bar(level.l);
+  $('mr').style.width=bar(level.r);
   requestAnimationFrame(draw);
 }
 requestAnimationFrame(draw);
